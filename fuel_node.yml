@@ -1,0 +1,123 @@
+---
+- name: Setup or Remove Fuel Node
+  hosts: localhost
+  become: true
+  vars_prompt:
+    - name: node_action
+      prompt: "Enter the action to perform (install, remove)"
+      private: no
+    - name: service_name
+      prompt: "Enter the service name for the Fuel node"
+      private: no
+    - name: eth_rpc_endpoint
+      prompt: "Enter your Alchemy Ethereum RPC endpoint (Sepolia)"
+      private: no
+
+  vars:
+    p2p_secret_path: "/root/fuel/p2p_secret"
+    home_fuel: "/root/fuel"
+    chain_config_path: "/root/fuel/chainConfig.json"
+    db_path: "/root/fuel/.fuel_beta5"
+    fuel_bin_path: "/root/.fuelup/bin"
+
+  tasks:
+    - block:
+        - name: Install Rust and Cargo
+          shell: |
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source $HOME/.cargo/env
+          args:
+            executable: /bin/bash
+
+        - name: Ensure expect is installed
+          apt:
+            name: expect
+            state: present
+
+        - name: Ensure jq is installed
+          apt:
+            name: jq
+            state: present    
+  
+        - name: Remove existing .fuelup directory
+          file:
+            path: "/root/.fuelup"
+            state: absent
+ 
+        - name: Install Fuel toolchain without interactive prompt
+          shell: |
+             curl https://install.fuel.network | sh -s -- --no-modify-path
+          args:
+             executable: /bin/bash
+
+        - name: Add Fuel toolchain to PATH permanently
+          lineinfile:
+            path: /root/.profile
+            line: 'export PATH=$PATH:{{ fuel_bin_path }}'
+            create: yes
+
+        - name: Create DB directory
+          file:
+            path: "{{ home_fuel }}"
+            state: directory
+            mode: '0755'
+
+        - name: Generate P2P secret key
+          shell: export PATH=$PATH:{{ fuel_bin_path }} && fuel-core-keygen new --key-type peering > {{ p2p_secret_path }}
+          args:
+            creates: "{{ p2p_secret_path }}"
+            executable: /bin/bash
+
+        - name: Read P2P secret key
+          shell: cat {{ p2p_secret_path }} | jq -r '.secret'
+          register: p2p_secret
+          changed_when: false
+          when: node_action == "install"
+    
+        - name: Create DB directory
+          file:
+            path: "{{ db_path }}"
+            state: directory
+            mode: '0755'
+
+        - name: Setup chainConfig.json using Jinja2 template
+          template:
+            src: templates/chainConfig.json.j2
+            dest: "{{ chain_config_path }}"
+
+        - name: Create Fuel node service
+          template:
+            src: templates/fuel-node.service.j2
+            dest: /etc/systemd/system/fuel-node.service
+
+        - name: Reload systemd, enable and start Fuel node service
+          systemd:
+            daemon_reload: yes
+            name: fuel-node
+            enabled: yes
+            state: stopped
+      when: node_action == "install"
+
+    - block:
+        - name: Stop and disable Fuel node service
+          systemd:
+            name: fuel-node
+            state: stopped
+            enabled: no
+           
+
+        - name: Remove Fuel node service file
+          file:
+            path: /etc/systemd/system/fuel-node.service
+            state: absent
+
+        - name: Remove chain configuration and data directories
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ db_path }}"
+            - "{{ chain_config_path }}"
+            - "{{ p2p_secret_path }}"
+      ignore_errors: true
+      when: node_action == "remove"
